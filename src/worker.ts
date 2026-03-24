@@ -1,328 +1,271 @@
 /**
- * Main worker — handles Paperclip events, Slack interactions, and bidirectional routing.
- * Uses Socket Mode for real-time Slack events (no public URL needed).
+ * Main worker — uses definePlugin + runWorker from @paperclipai/plugin-sdk.
+ * Socket Mode for real-time Slack events, ctx.events.on() for Paperclip events.
  */
 
+import { definePlugin, runWorker } from '@paperclipai/plugin-sdk';
+import type { PluginContext, PluginEvent, ScopeKey } from '@paperclipai/plugin-sdk';
 import { WebClient } from '@slack/web-api';
 import { SocketModeClient } from '@slack/socket-mode';
-import type { PluginContext, PluginWorker } from '@paperclipai/plugin-sdk';
 import { SlackAdapter } from './adapter.js';
-import { ReplyRouter } from './reply-router.js';
-import { EscalationManager } from './escalation.js';
-import { getCommandHandler } from './commands.js';
 import { ACTIONS } from './constants.js';
 import {
   formatIssueCreated,
   formatIssueStatusChanged,
-  formatIssueComment,
   formatApprovalCreated,
   formatAgentRunFailed,
   formatAgentRunCompleted,
   formatDailyDigest,
-  type IssueEvent,
-  type ApprovalEvent,
-  type AgentRunEvent,
 } from './formatters.js';
 
-export default function createWorker(): PluginWorker {
-  let webClient: WebClient;
-  let socketClient: SocketModeClient;
-  let adapter: SlackAdapter;
-  let replyRouter: ReplyRouter;
-  let escalationManager: EscalationManager;
-  let settings: Record<string, unknown>;
-  let baseUrl: string;
+function scopeKey(stateKey: string): ScopeKey {
+  return { scopeKind: 'instance', stateKey };
+}
 
-  function channelFor(type: 'approvals' | 'errors' | 'escalations'): string {
-    const specific = settings[`${type}ChannelId`] as string | undefined;
-    return specific || (settings['defaultChannelId'] as string);
-  }
+interface ThreadMapping {
+  issueId: string;
+  issueIdentifier: string;
+  companyId: string;
+  channelId: string;
+}
 
-  return {
-    async start(ctx: PluginContext) {
-      settings = ctx.settings;
-      baseUrl = ctx.serverUrl;
+const plugin = definePlugin({
+  async setup(ctx: PluginContext) {
+    const config = await ctx.config.get();
+    const botToken = await ctx.secrets.resolve(config['slackBotTokenRef'] as string);
+    const appToken = await ctx.secrets.resolve(config['slackAppTokenRef'] as string);
+    const defaultChannel = config['defaultChannelId'] as string;
 
-      // Initialize Slack clients
-      const botToken = await ctx.secrets.resolve(settings['slackBotTokenRef'] as string);
-      const appToken = await ctx.secrets.resolve(settings['slackAppTokenRef'] as string);
+    const webClient = new WebClient(botToken);
+    const socketClient = new SocketModeClient({ appToken });
+    const adapter = new SlackAdapter(webClient);
 
-      webClient = new WebClient(botToken);
-      socketClient = new SocketModeClient({ appToken });
-      adapter = new SlackAdapter(webClient);
+    function channelFor(type: 'approvals' | 'errors' | 'escalations'): string {
+      return (config[`${type}ChannelId`] as string) || defaultChannel;
+    }
 
-      // Initialize subsystems
-      replyRouter = new ReplyRouter(ctx);
-      await replyRouter.init();
+    // ── Thread mapping state ──
 
-      escalationManager = new EscalationManager(ctx, adapter);
-      await escalationManager.init();
+    async function getMappings(): Promise<Record<string, ThreadMapping>> {
+      const stored = await ctx.state.get(scopeKey('thread_mappings'));
+      return (stored as Record<string, ThreadMapping> | null) ?? {};
+    }
 
-      // ── Socket Mode: handle Slack events ──
+    async function setMapping(threadTs: string, mapping: ThreadMapping): Promise<void> {
+      const mappings = await getMappings();
+      mappings[threadTs] = mapping;
+      await ctx.state.set(scopeKey('thread_mappings'), mappings);
+    }
 
-      // Message events (reply routing)
-      socketClient.on('message', async ({ event, ack }) => {
-        await ack();
-        if (!settings['enableReplyRouting']) return;
-        if (event.bot_id) return; // Ignore bot messages (our own)
-        if (!event.thread_ts) return; // Only threaded replies
+    // Helper to get first company ID
+    async function getCompanyId(): Promise<string | null> {
+      const companies = await ctx.companies.list();
+      return companies.length > 0 ? companies[0].id : null;
+    }
 
-        const result = await replyRouter.routeReply(
-          event.thread_ts,
-          event.user,
-          event.text
-        );
+    // ── Slack Socket Mode: inbound ──
 
-        if (result) {
-          // React to confirm routing
-          await webClient.reactions.add({
-            channel: event.channel,
-            timestamp: event.ts,
-            name: 'white_check_mark',
-          });
-        }
+    socketClient.on('message', async ({ event, ack }: { event: Record<string, string>; ack: () => Promise<void> }) => {
+      await ack();
+      if (!config['enableReplyRouting']) return;
+      if (event['bot_id']) return;
+      if (!event['thread_ts']) return;
+
+      const mappings = await getMappings();
+      const mapping = mappings[event['thread_ts']];
+      if (!mapping) return;
+
+      await ctx.issues.createComment(
+        mapping.issueId,
+        `**Board** (via Slack <@${event['user']}>):\n\n${event['text']}`,
+        mapping.companyId
+      );
+
+      await webClient.reactions.add({
+        channel: event['channel'],
+        timestamp: event['ts'],
+        name: 'white_check_mark',
       });
+    });
 
-      // Slash commands
-      socketClient.on('slash_commands', async ({ command, ack, body }) => {
-        const cmdName = command.replace('/', '');
-        const handler = getCommandHandler(cmdName);
+    socketClient.on('interactive', async ({ action, ack, body }: { action: Record<string, string>; ack: () => Promise<void>; body: Record<string, Record<string, string>> }) => {
+      await ack();
+      const actionId = action['action_id'];
 
-        if (!handler) {
-          await ack({ text: `Unknown command: ${command}` });
-          return;
-        }
+      if (actionId === ACTIONS.APPROVE || actionId === ACTIONS.REJECT) {
+        const approvalId = action['value'];
+        const resolution = actionId === ACTIONS.APPROVE ? 'approved' : 'rejected';
 
-        await ack(); // Acknowledge immediately
-
-        const companyId = settings['companyId'] as string || ctx.companyId;
-        const response = await handler(body.text ?? '', {
-          ctx,
-          adapter,
-          channelId: body.channel_id,
-          userId: body.user_id,
-          companyId,
+        await ctx.http.fetch(`/api/approvals/${approvalId}/resolve`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ resolution, resolvedBy: 'board' }),
         });
 
-        await adapter.sendText(body.channel_id, response);
-      });
+        await adapter.editMessage(
+          { channelId: body['channel']['id'], messageTs: body['message']['ts'] },
+          `Approval *${resolution}* by <@${body['user']['id']}>`
+        );
+      }
+    });
 
-      // Interactive buttons (approve/reject/escalation)
-      socketClient.on('interactive', async ({ action, ack, body }) => {
+    socketClient.on('slash_commands', async ({ command, ack, body }: { command: string; ack: (r?: { text: string }) => Promise<void>; body: Record<string, string> }) => {
+      const cmdName = command.replace(/^\/hq-/, '');
+      const companyId = await getCompanyId();
+      if (!companyId) { await ack({ text: 'No companies found.' }); return; }
+
+      if (cmdName === 'status') {
         await ack();
-        const actionId = action.action_id;
+        const agents = await ctx.agents.list({ companyId });
+        const issues = await ctx.issues.list({ companyId });
+        await adapter.sendText(body['channel_id'], [
+          '*HQ Status*',
+          `*Agents:* ${agents.length}`,
+          `*Issues:* ${issues.length}`,
+        ].join('\n'));
+      } else if (cmdName === 'issues') {
+        await ack();
+        const issues = await ctx.issues.list({ companyId });
+        if (!issues.length) { await adapter.sendText(body['channel_id'], 'No open issues.'); return; }
+        const lines = issues.slice(0, 10).map((i) => `*${i.identifier}* ${i.title} — _${i.status}_`);
+        await adapter.sendText(body['channel_id'], `*Open Issues* (${issues.length})\n\n${lines.join('\n')}`);
+      } else if (cmdName === 'agents') {
+        await ack();
+        const agents = await ctx.agents.list({ companyId });
+        const lines = agents.map((a) => `*${a.name}* (${a.role}) — _${a.status}_`);
+        await adapter.sendText(body['channel_id'], `*Agents* (${agents.length})\n\n${lines.join('\n')}`);
+      } else {
+        await ack({ text: `Unknown command: ${command}` });
+      }
+    });
 
-        // Approval buttons
-        if (actionId.startsWith(ACTIONS.APPROVE) || actionId.startsWith(ACTIONS.REJECT)) {
-          const approvalId = action.value;
-          const resolution = actionId.startsWith(ACTIONS.APPROVE) ? 'approved' : 'rejected';
+    await socketClient.start();
+    ctx.logger.info('Slack Socket Mode connected');
 
-          await ctx.api.post(`/api/approvals/${approvalId}/resolve`, {
-            resolution,
-            resolvedBy: 'board',
-          });
+    // ── Paperclip events ──
 
-          // Update the message
-          const ref = {
-            channelId: body.channel.id,
-            messageTs: body.message.ts,
-          };
-          await adapter.editMessage(
-            ref,
-            `✅ Approval *${resolution}* by <@${body.user.id}>`
-          );
-        }
-
-        // Escalation buttons
-        const parsed = EscalationManager.parseActionId(actionId);
-        if (parsed) {
-          const resolution = action.value === 'dismiss'
-            ? 'Dismissed'
-            : action.value;
-          await escalationManager.resolveEscalation(parsed.escalationId, resolution);
-        }
+    ctx.events.on('issue.created', async (event: PluginEvent) => {
+      if (!config['notifyIssueCreated']) return;
+      const text = formatIssueCreated(event.payload as Parameters<typeof formatIssueCreated>[0], '');
+      const ref = await adapter.sendText(defaultChannel, text);
+      const payload = event.payload as { issue: { id: string; identifier: string } };
+      await setMapping(ref.messageTs, {
+        issueId: payload.issue.id,
+        issueIdentifier: payload.issue.identifier,
+        companyId: event.companyId,
+        channelId: ref.channelId,
       });
+    });
 
-      // Start Socket Mode connection
-      await socketClient.start();
-      ctx.log.info('Slack plugin started (Socket Mode connected)');
-    },
+    ctx.events.on('issue.updated', async (event: PluginEvent) => {
+      if (!config['notifyIssueUpdated']) return;
+      const text = formatIssueStatusChanged(event.payload as Parameters<typeof formatIssueStatusChanged>[0], '');
+      await adapter.sendText(defaultChannel, text);
+    });
 
-    async stop() {
-      if (socketClient) {
-        await socketClient.disconnect();
+    ctx.events.on('approval.created', async (event: PluginEvent) => {
+      if (!config['notifyApprovalCreated']) return;
+      const payload = event.payload as Parameters<typeof formatApprovalCreated>[0];
+      const text = formatApprovalCreated(payload, '');
+      const ref = await adapter.sendButtons(channelFor('approvals'), text, [
+        { text: 'Approve', action: ACTIONS.APPROVE, value: payload.approval.id, style: 'primary' },
+        { text: 'Reject', action: ACTIONS.REJECT, value: payload.approval.id, style: 'danger' },
+      ]);
+      if (payload.approval.issueId) {
+        await setMapping(ref.messageTs, {
+          issueId: payload.approval.issueId, issueIdentifier: '',
+          companyId: event.companyId, channelId: ref.channelId,
+        });
       }
-    },
+    });
 
-    // ── Paperclip event handlers ──
+    ctx.events.on('agent.run.failed', async (event: PluginEvent) => {
+      if (!config['notifyAgentError']) return;
+      await adapter.sendText(channelFor('errors'), formatAgentRunFailed(event.payload as Parameters<typeof formatAgentRunFailed>[0], ''));
+    });
 
-    async onEvent(ctx: PluginContext, eventType: string, payload: unknown) {
-      const data = payload as Record<string, unknown>;
+    ctx.events.on('agent.run.finished', async (event: PluginEvent) => {
+      if (!config['notifyRunFinished']) return;
+      await adapter.sendText(defaultChannel, formatAgentRunCompleted(event.payload as Parameters<typeof formatAgentRunCompleted>[0], ''));
+    });
 
-      switch (eventType) {
-        case 'issue.created': {
-          if (!settings['notifyIssueCreated']) return;
-          const text = formatIssueCreated(data as IssueEvent, baseUrl);
-          const ref = await adapter.sendText(settings['defaultChannelId'] as string, text);
-          const issue = (data as IssueEvent).issue;
-          await replyRouter.registerThread(ref.messageTs, {
-            issueId: issue.id,
-            issueIdentifier: issue.identifier,
-            companyId: ctx.companyId,
-            channelId: ref.channelId,
-          });
-          break;
-        }
-
-        case 'issue.status_changed': {
-          if (!settings['notifyIssueStatusChanged']) return;
-          const text = formatIssueStatusChanged(data as IssueEvent, baseUrl);
-          await adapter.sendText(settings['defaultChannelId'] as string, text);
-          break;
-        }
-
-        case 'issue.comment_created': {
-          // Only forward agent comments, not board comments (avoid loops)
-          const event = data as IssueEvent;
-          if (!event.comment?.authorAgentId) return;
-          const agents = await ctx.api.get<Array<{ id: string; name: string }>>(
-            `/api/companies/${ctx.companyId}/agents`
-          );
-          const agent = agents.find((a) => a.id === event.comment!.authorAgentId);
-          const text = formatIssueComment(event, agent?.name ?? null, baseUrl);
-          await adapter.sendText(settings['defaultChannelId'] as string, text);
-          break;
-        }
-
-        case 'approval.created': {
-          if (!settings['notifyApprovalCreated']) return;
-          const event = data as ApprovalEvent;
-          const text = formatApprovalCreated(event, baseUrl);
-          const buttons = [
-            {
-              text: 'Approve',
-              action: ACTIONS.APPROVE,
-              value: event.approval.id,
-              style: 'primary' as const,
-            },
-            {
-              text: 'Reject',
-              action: ACTIONS.REJECT,
-              value: event.approval.id,
-              style: 'danger' as const,
-            },
-          ];
-          const ref = await adapter.sendButtons(
-            channelFor('approvals'),
-            text,
-            buttons
-          );
-          // Register thread so replies also route to the issue
-          if (event.approval.issueId) {
-            await replyRouter.registerThread(ref.messageTs, {
-              issueId: event.approval.issueId,
-              issueIdentifier: '',
-              companyId: ctx.companyId,
-              channelId: ref.channelId,
-            });
-          }
-          break;
-        }
-
-        case 'agent.run.failed': {
-          if (!settings['notifyAgentError']) return;
-          const text = formatAgentRunFailed(data as AgentRunEvent, baseUrl);
-          await adapter.sendText(channelFor('errors'), text);
-          break;
-        }
-
-        case 'agent.run.completed': {
-          if (!settings['notifyRunCompleted']) return;
-          const text = formatAgentRunCompleted(data as AgentRunEvent, baseUrl);
-          await adapter.sendText(settings['defaultChannelId'] as string, text);
-          break;
-        }
-
-        case 'agent.paused': {
-          const event = data as { agent: { id: string; name: string; pauseReason?: string } };
-          const text = `⏸️ *${event.agent.name}* paused${event.agent.pauseReason ? `: ${event.agent.pauseReason}` : ''}`;
-          await adapter.sendText(channelFor('errors'), text);
-          break;
-        }
+    ctx.events.on('agent.status_changed', async (event: PluginEvent) => {
+      const payload = event.payload as { agent: { name: string; status: string; pauseReason?: string } };
+      if (payload.agent.status === 'paused') {
+        await adapter.sendText(channelFor('errors'), `*${payload.agent.name}* paused${payload.agent.pauseReason ? `: ${payload.agent.pauseReason}` : ''}`);
       }
-    },
+    });
 
-    // ── Tool handlers (called by agents) ──
+    // ── Tools ──
 
-    async onToolCall(ctx: PluginContext, toolName: string, params: Record<string, unknown>) {
-      switch (toolName) {
-        case 'escalate_to_human': {
-          const agents = await ctx.api.get<Array<{ id: string; name: string }>>(
-            `/api/companies/${ctx.companyId}/agents`
-          );
-          const agent = agents.find((a) => a.id === (params['agentId'] as string));
-          await escalationManager.createEscalation(channelFor('escalations'), {
-            issueId: params['issueId'] as string,
-            issueIdentifier: (params['issueIdentifier'] as string) ?? '',
-            agentId: (params['agentId'] as string) ?? ctx.agentId,
-            agentName: agent?.name ?? 'Unknown Agent',
-            reason: params['reason'] as string,
-            suggestedReplies: params['suggestedReplies'] as string[] | undefined,
-          });
-          return { success: true, message: 'Escalation posted to Slack' };
-        }
-
-        case 'post_to_channel': {
-          const ref = await adapter.sendText(
-            params['channelId'] as string,
-            params['text'] as string,
-            params['threadTs'] ? { threadTs: params['threadTs'] as string } : undefined
-          );
-          return { success: true, messageTs: ref.messageTs };
-        }
+    ctx.tools.register('escalate_to_human', {
+      displayName: 'Escalate to Human',
+      description: 'Escalate an issue to a human via Slack.',
+      parametersSchema: { type: 'object', properties: { issueId: { type: 'string' }, reason: { type: 'string' }, suggestedReplies: { type: 'array', items: { type: 'string' } } }, required: ['issueId', 'reason'] },
+    }, async (params: unknown, toolCtx) => {
+      const p = params as Record<string, unknown>;
+      const agents = await ctx.agents.list({ companyId: toolCtx.companyId });
+      const agent = agents.find((a) => a.id === toolCtx.agentId);
+      const text = [
+        `*Escalation from ${agent?.name ?? 'Unknown'}*`,
+        `*Issue:* ${p['issueIdentifier'] ?? p['issueId']}`,
+        `*Reason:* ${p['reason']}`,
+        '_Reply in this thread or use the buttons below._',
+      ].join('\n');
+      const buttons = [
+        ...(p['suggestedReplies'] as string[] ?? []).map((reply, i) => ({
+          text: reply.length > 30 ? reply.slice(0, 27) + '...' : reply,
+          action: `${ACTIONS.ESCALATION_REPLY}_${i}`, value: reply, style: 'primary' as const,
+        })),
+        { text: 'Dismiss', action: ACTIONS.ESCALATION_DISMISS, value: 'dismiss', style: 'danger' as const },
+      ];
+      const ref = await adapter.sendButtons(channelFor('escalations'), text, buttons);
+      if (p['issueId']) {
+        await setMapping(ref.messageTs, {
+          issueId: p['issueId'] as string, issueIdentifier: (p['issueIdentifier'] as string) ?? '',
+          companyId: toolCtx.companyId, channelId: ref.channelId,
+        });
       }
+      return { content: 'Escalation posted to Slack.' };
+    });
 
-      return { error: `Unknown tool: ${toolName}` };
-    },
+    ctx.tools.register('post_to_channel', {
+      displayName: 'Post to Channel',
+      description: 'Post a message to a Slack channel.',
+      parametersSchema: { type: 'object', properties: { channelId: { type: 'string' }, text: { type: 'string' }, threadTs: { type: 'string' } }, required: ['channelId', 'text'] },
+    }, async (params: unknown) => {
+      const p = params as Record<string, unknown>;
+      const ref = await adapter.sendText(p['channelId'] as string, p['text'] as string,
+        p['threadTs'] ? { threadTs: p['threadTs'] as string } : undefined);
+      return { content: `Message posted (ts: ${ref.messageTs})` };
+    });
 
-    // ── Scheduled jobs ──
+    // ── Jobs ──
 
-    async onJob(ctx: PluginContext, jobId: string) {
-      switch (jobId) {
-        case 'daily-digest': {
-          const dashboard = await ctx.api.get<{
-            agents: { total: number };
-            issues: { created24h: number; closed24h: number };
-            runs: { completed24h: number; failed24h: number };
-            costs: { monthSpendCents: number };
-            approvals: { pending: number };
-          }>(`/api/companies/${ctx.companyId}/dashboard`);
+    ctx.jobs.register('daily-digest', async () => {
+      const companyId = await getCompanyId();
+      if (!companyId) return;
+      const agents = await ctx.agents.list({ companyId });
+      await adapter.sendText(defaultChannel, formatDailyDigest({
+        issuesCreated: 0, issuesClosed: 0, runsCompleted: 0, runsFailed: 0,
+        totalCostCents: 0, activeAgents: agents.length, pendingApprovals: 0,
+      }));
+    });
 
-          const text = formatDailyDigest({
-            issuesCreated: dashboard.issues.created24h,
-            issuesClosed: dashboard.issues.closed24h,
-            runsCompleted: dashboard.runs.completed24h,
-            runsFailed: dashboard.runs.failed24h,
-            totalCostCents: dashboard.costs.monthSpendCents,
-            activeAgents: dashboard.agents.total,
-            pendingApprovals: dashboard.approvals.pending,
-          });
-          await adapter.sendText(settings['defaultChannelId'] as string, text);
-          break;
-        }
-
-        case 'escalation-timeout': {
-          const timeoutMs =
-            ((settings['escalationTimeoutMinutes'] as number) ?? 30) * 60 * 1000;
-          const defaultAction = (settings['escalationDefaultAction'] as string) ?? 'skip';
-          if (timeoutMs > 0) {
-            await escalationManager.checkTimeouts(timeoutMs, defaultAction);
-          }
-          // Also clean up old thread mappings
-          await replyRouter.cleanup();
-          break;
-        }
+    ctx.jobs.register('thread-cleanup', async () => {
+      const mappings = await getMappings();
+      const cutoff = (Date.now() - 7 * 24 * 60 * 60 * 1000) / 1000;
+      let cleaned = 0;
+      for (const ts of Object.keys(mappings)) {
+        if (parseFloat(ts) < cutoff) { delete mappings[ts]; cleaned++; }
       }
-    },
-  };
-}
+      if (cleaned > 0) {
+        await ctx.state.set(scopeKey('thread_mappings'), mappings);
+        ctx.logger.info(`Cleaned ${cleaned} stale thread mappings`);
+      }
+    });
+  },
+});
+
+export default plugin;
+runWorker(plugin, import.meta.url);

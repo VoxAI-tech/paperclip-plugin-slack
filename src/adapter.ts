@@ -101,7 +101,7 @@ export class SlackAdapter implements PlatformAdapter {
 
   async editMessage(ref: MessageRef, text: string, buttons?: ActionButton[]): Promise<void> {
     const blocks: Array<Record<string, unknown>> = [
-      { type: 'section', text: { type: 'mrkdwn', text } },
+      { type: 'section' as const, text: { type: 'mrkdwn' as const, text } },
     ];
 
     if (buttons?.length) {
@@ -119,7 +119,7 @@ export class SlackAdapter implements PlatformAdapter {
       channel: ref.channelId,
       ts: ref.messageTs,
       text,
-      blocks,
+      blocks: blocks as never[],
     });
   }
 
