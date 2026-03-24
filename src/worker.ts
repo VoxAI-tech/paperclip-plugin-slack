@@ -32,9 +32,24 @@ interface ThreadMapping {
 const plugin = definePlugin({
   async setup(ctx: PluginContext) {
     const config = await ctx.config.get();
-    const botToken = await ctx.secrets.resolve(config['slackBotTokenRef'] as string);
-    const appToken = await ctx.secrets.resolve(config['slackAppTokenRef'] as string);
-    const defaultChannel = config['defaultChannelId'] as string;
+
+    // Guard: if not configured yet, register events/tools but skip Slack connection
+    const botTokenRef = config['slackBotTokenRef'] as string | undefined;
+    const appTokenRef = config['slackAppTokenRef'] as string | undefined;
+    const defaultChannel = (config['defaultChannelId'] as string) || '';
+
+    if (!botTokenRef || !appTokenRef || !defaultChannel) {
+      ctx.logger.info('Slack plugin not yet configured — waiting for settings');
+      return;
+    }
+
+    // Resolve secrets — support both Paperclip secret refs (UUIDs) and direct token values
+    async function resolveTokenOrSecret(value: string): Promise<string> {
+      if (value.startsWith('xoxb-') || value.startsWith('xapp-')) return value;
+      try { return await ctx.secrets.resolve(value); } catch { return value; }
+    }
+    const botToken = await resolveTokenOrSecret(botTokenRef);
+    const appToken = await resolveTokenOrSecret(appTokenRef);
 
     const webClient = new WebClient(botToken);
     const socketClient = new SocketModeClient({ appToken });
@@ -139,8 +154,11 @@ const plugin = definePlugin({
       }
     });
 
-    await socketClient.start();
-    ctx.logger.info('Slack Socket Mode connected');
+    // Start Socket Mode in the background — don't block setup()
+    socketClient.start().then(
+      () => ctx.logger.info('Slack Socket Mode connected'),
+      (err) => ctx.logger.error('Slack Socket Mode failed to connect', { error: String(err) })
+    );
 
     // ── Paperclip events ──
 
