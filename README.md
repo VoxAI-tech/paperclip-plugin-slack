@@ -1,6 +1,6 @@
-# @voxai/paperclip-plugin-slack
+# paperclip-plugin-slack
 
-Bidirectional Slack integration for [Paperclip](https://github.com/paperclipai/paperclip). Based on the architecture of [paperclip-plugin-telegram](https://github.com/mvanhorn/paperclip-plugin-telegram).
+Bidirectional Slack integration for [Paperclip](https://github.com/paperclipai/paperclip). Built by [Vox AI](https://vox.ai). Based on the architecture of [paperclip-plugin-telegram](https://github.com/mvanhorn/paperclip-plugin-telegram).
 
 ## Features
 

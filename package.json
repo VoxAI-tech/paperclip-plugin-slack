@@ -1,7 +1,7 @@
 {
-  "name": "@voxai/paperclip-plugin-slack",
+  "name": "paperclip-plugin-slack",
   "version": "0.1.0",
-  "description": "Bidirectional Slack plugin for Paperclip — notifications, reply routing, approve/reject buttons, bot commands.",
+  "description": "Bidirectional Slack plugin for Paperclip — notifications, reply routing, approve/reject buttons, slash commands.",
   "type": "module",
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
@@ -9,7 +9,7 @@
     "manifest": "./dist/manifest.js",
     "worker": "./dist/worker.js"
   },
-  "files": ["dist"],
+  "files": ["dist", "README.md", "LICENSE"],
   "scripts": {
     "build": "tsc",
     "dev": "tsc --watch",
@@ -17,6 +17,35 @@
     "test:watch": "vitest",
     "clean": "rm -rf dist *.tsbuildinfo",
     "prepublishOnly": "npm run build"
+  },
+  "keywords": [
+    "paperclip",
+    "paperclip-plugin",
+    "slack",
+    "slack-bot",
+    "ai-agents",
+    "notifications",
+    "bidirectional",
+    "reply-routing",
+    "approvals"
+  ],
+  "author": {
+    "name": "Vox AI",
+    "url": "https://vox.ai"
+  },
+  "contributors": [
+    {
+      "name": "Maurice Kroon",
+      "url": "https://github.com/xapss"
+    }
+  ],
+  "homepage": "https://github.com/VoxAI-tech/paperclip-plugin-slack",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/VoxAI-tech/paperclip-plugin-slack.git"
+  },
+  "bugs": {
+    "url": "https://github.com/VoxAI-tech/paperclip-plugin-slack/issues"
   },
   "dependencies": {
     "@slack/web-api": "^7.9.0",
