@@ -1,0 +1,39 @@
+{
+  "name": "@voxai/paperclip-plugin-slack",
+  "version": "0.1.0",
+  "description": "Bidirectional Slack plugin for Paperclip — notifications, reply routing, approve/reject buttons, bot commands.",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "paperclip": {
+    "manifest": "./dist/manifest.js",
+    "worker": "./dist/worker.js"
+  },
+  "files": ["dist"],
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsc --watch",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "clean": "rm -rf dist *.tsbuildinfo",
+    "prepublishOnly": "npm run build"
+  },
+  "dependencies": {
+    "@slack/web-api": "^7.9.0",
+    "@slack/socket-mode": "^2.1.0"
+  },
+  "devDependencies": {
+    "@paperclipai/plugin-sdk": "^2026.318.0",
+    "@paperclipai/shared": "^2026.318.0",
+    "typescript": "^5.8.3",
+    "vitest": "^3.2.1"
+  },
+  "peerDependencies": {
+    "@paperclipai/plugin-sdk": "^2026.318.0",
+    "@paperclipai/shared": "^2026.318.0"
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "license": "MIT"
+}
