@@ -3,7 +3,7 @@
  * Socket Mode for real-time Slack events, ctx.events.on() for Paperclip events.
  */
 
-import { definePlugin, runWorker } from '@paperclipai/plugin-sdk';
+import { definePlugin, startWorkerRpcHost } from '@paperclipai/plugin-sdk';
 import type { PluginContext, PluginEvent, ScopeKey } from '@paperclipai/plugin-sdk';
 import { WebClient } from '@slack/web-api';
 import { SocketModeClient } from '@slack/socket-mode';
@@ -29,9 +29,32 @@ interface ThreadMapping {
   channelId: string;
 }
 
+console.error('[slack-plugin] Worker starting...');
+
 const plugin = definePlugin({
+  async onValidateConfig(config: Record<string, unknown>) {
+    console.error('[slack-plugin] onValidateConfig called');
+    if (!config['slackBotTokenRef'] || typeof config['slackBotTokenRef'] !== 'string') {
+      return { ok: false, errors: ['slackBotTokenRef is required'] };
+    }
+    if (!config['slackAppTokenRef'] || typeof config['slackAppTokenRef'] !== 'string') {
+      return { ok: false, errors: ['slackAppTokenRef is required'] };
+    }
+    if (!config['defaultChannelId'] || typeof config['defaultChannelId'] !== 'string') {
+      return { ok: false, errors: ['defaultChannelId is required'] };
+    }
+    return { ok: true };
+  },
+
+  async onHealth() {
+    console.error('[slack-plugin] onHealth called');
+    return { status: 'ok' as const };
+  },
+
   async setup(ctx: PluginContext) {
+    console.error('[slack-plugin] setup() called');
     const config = await ctx.config.get();
+    console.error('[slack-plugin] config loaded:', JSON.stringify(Object.keys(config)));
 
     // Guard: if not configured yet, register events/tools but skip Slack connection
     const botTokenRef = config['slackBotTokenRef'] as string | undefined;
@@ -285,5 +308,4 @@ const plugin = definePlugin({
   },
 });
 
-export default plugin;
-runWorker(plugin, import.meta.url);
+startWorkerRpcHost({ plugin });
